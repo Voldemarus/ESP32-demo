@@ -2,6 +2,7 @@ idf_component_register(
     SRCS "blink_example_main.c"
     REQUIRES
         esp_common
+	esp_gdbstub	# поддержка отладчика без JTAG
         esp_libc        # базовая C-библиотека (заменяет newlib)
         freertos
         log

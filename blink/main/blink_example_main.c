@@ -44,6 +44,7 @@ static int s_retry_num = 0;
 static uint8_t s_led_state = 0;
 static volatile bool s_error_blink_active = false;
 static TaskHandle_t s_err_blink_task = NULL;
+static uint8_t WiFiConnected = 0;
 
 /* ==================================================================
  *  Индикация ошибок Wi-Fi (не блокирует другие задачи)
@@ -64,23 +65,6 @@ static TaskHandle_t s_err_blink_task = NULL;
  *
  * @param blink_count число миганий (0 — ничего не делать)
  */
-static void report_wifi_error(int blink_count)
-{
-    if (s_err_blink_task != NULL && blink_count > 0)
-    {
-        /* Перезаписываем предыдущее значение, если новая ошибка пришла раньше */
-        xTaskNotify(s_err_blink_task, (uint32_t)blink_count, eSetValueWithOverwrite);
-    }
-}
-
-/**
- * @brief Задача фоновой индикации ошибок внешним светодиодом.
- *
- * Ждёт уведомления бесконечно (без нагрузки на CPU). По получении
- * мигает `BLINK_GPIO_2` 0.3 с вкл / 0.3 с выкл нужное число раз,
- * затем держит паузу 2 с. На время индикации взводит флаг
- * `s_error_blink_active`, чтобы основной цикл не конфликтовал за пин.
- */
 static void err_blink_task(void *arg)
 {
     uint32_t count;
@@ -96,14 +80,45 @@ static void err_blink_task(void *arg)
                 gpio_set_level(BLINK_GPIO_2, 0);
                 vTaskDelay(pdMS_TO_TICKS(300));
             }
-            /* Пауза 2 секунды после серии миганий */
             vTaskDelay(pdMS_TO_TICKS(2000));
 
-            /* Возвращаем пин основному циклу в согласованное состояние */
             gpio_set_level(BLINK_GPIO_2, !s_led_state);
             s_error_blink_active = false;
         }
     }
+}
+
+/**
+ * @brief Задача фоновой индикации ошибок внешним светодиодом.
+ *
+ * Ждёт уведомления бесконечно (без нагрузки на CPU). По получении
+ * мигает `BLINK_GPIO_2` 0.3 с вкл / 0.3 с выкл нужное число раз,
+ * затем держит паузу 2 с. На время индикации взводит флаг
+ * `s_error_blink_active`, чтобы основной цикл не конфликтовал за пин.
+ */
+static void report_wifi_error(int blink_count)
+{
+    if (s_err_blink_task == NULL || blink_count <= 0)
+    {
+        return;
+    }
+
+    static const char *err_messages[] = {
+        "неизвестная ошибка",                                   /* 1 */
+        "сеть (AP) не найдена",                                 /* 2 */
+        "ошибка аутентификации (неверный пароль)",              /* 3 */
+        "таймаут 4-way handshake (неверный пароль/шифрование)", /* 4 */
+        "ошибка ассоциации",                                    /* 5 */
+    };
+
+    int idx = blink_count - 1;
+    if (idx >= 0 && idx < (int)(sizeof(err_messages) / sizeof(err_messages[0])))
+    {
+        ESP_LOGW(TAG, "Wi-Fi error (%d blink(s)): %s",
+                 blink_count, err_messages[idx]);
+    }
+
+    xTaskNotify(s_err_blink_task, (uint32_t)blink_count, eSetValueWithOverwrite);
 }
 
 /* ==================================================================
@@ -121,12 +136,26 @@ static void configure_led(void)
 
 static void blink_led(void)
 {
-    /* Пока идёт индикация ошибки, основной цикл не трогает BLINK_GPIO_2 */
-    if (s_error_blink_active)
-        return;
+    if (!WiFiConnected)
+    {
+        // Если не установлено соединение, моргаем диодом на плате */
+        gpio_set_level(BLINK_GPIO, s_led_state);
+    }
+    else
+    {
+        /* моргаем внешним диодом */
+        gpio_set_level(BLINK_GPIO_2, s_led_state);
+    }
+}
 
-    gpio_set_level(BLINK_GPIO, s_led_state);
-    gpio_set_level(BLINK_GPIO_2, !s_led_state);
+/**
+ *  Включаем светодиод на плате, выключаем внешний индикатор ошибок
+ */
+static void turn_on_wifi_indicator(void)
+{
+    gpio_set_level(BLINK_GPIO, 1);
+    gpio_set_level(BLINK_GPIO_2, 0);
+    WiFiConnected = 1;
 }
 
 /* ==================================================================
@@ -144,7 +173,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     {
         wifi_event_sta_disconnected_t *ev = (wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGW(TAG, "WiFi disconnected, reason=%d", ev->reason);
-
+        WiFiConnected = 0; /* выключаем индикатор на плате */
         /* Индикация ошибки — количество миганий зависит от причины */
         switch (ev->reason)
         {
@@ -178,7 +207,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         {
             esp_wifi_connect();
             s_retry_num++;
-            ESP_LOGI(TAG, "Retry WiFi connection (%d/5)", s_retry_num);
+            ESP_LOGI(TAG, "попытка переподключения к WiFi (%d/5)", s_retry_num);
         }
         else
         {
@@ -191,13 +220,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&ev->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        /* включаем индикатор */
+        turn_on_wifi_indicator();
     }
 }
 
-void wifi_init_sta(void)
+int wifi_init_sta(void)
 {
     s_wifi_event_group = xEventGroupCreate();
-
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -205,7 +235,8 @@ void wifi_init_sta(void)
 
     // Инициализация NVS — обязательна для Wi-Fi
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
@@ -239,11 +270,11 @@ void wifi_init_sta(void)
     {
         ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(err));
         report_wifi_error(1);
-        return;
+        return 0;
     }
 
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "wifi_init_sta: connecting to SSID '%s'", CONFIG_WIFI_NAME);
+    ESP_LOGI(TAG, "wifi_init_sta: подключение к SSID '%s'", CONFIG_WIFI_NAME);
 
     /* Необязательное ожидание: убеждаемся в исходе, но не блокируем
        остальную систему — индикация ошибок уже работает в своей задаче. */
@@ -252,11 +283,13 @@ void wifi_init_sta(void)
                                            pdFALSE, pdFALSE, portMAX_DELAY);
     if (bits & WIFI_CONNECTED_BIT)
     {
-        ESP_LOGI(TAG, "Connected to %s", CONFIG_WIFI_NAME);
+        ESP_LOGI(TAG, "Подключен к %s", CONFIG_WIFI_NAME);
+        return 1;
     }
     else
     {
-        ESP_LOGE(TAG, "Failed to connect to %s", CONFIG_WIFI_NAME);
+        ESP_LOGE(TAG, "Не удалось подключиться к %s", CONFIG_WIFI_NAME);
+        return 0;
     }
 }
 
@@ -272,13 +305,16 @@ void app_main(void)
        принимать уведомления об ошибках. */
     xTaskCreate(err_blink_task, "err_blink", 2048, NULL, 5, &s_err_blink_task);
 
-    wifi_init_sta();
+    /* Поднимаем WiFi соединение */
+    int WiFiConnected = wifi_init_sta();
 
-    while (1)
+    /* Включаем цикл, работающий пока работает соединение */
+    while (WiFiConnected)
     {
-        ESP_LOGI(TAG, "Turning LED %s", s_led_state ? "Blue" : "Red");
+        /* ESP_LOGI(TAG, "Индикатор  %s", s_led_state ? "Вкл." : "Выкл."); */
         blink_led();
         s_led_state = !s_led_state;
+        /* Таймер в отдельном потоке */
         vTaskDelay(CONFIG_BLINK_PERIOD / portTICK_PERIOD_MS);
     }
 }
